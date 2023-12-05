@@ -6,14 +6,23 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Appointment } from './appointment.entity';
+import { Appointment } from '../common/entities/appointment.entity';
 import { Between, Equal, FindOptionsWhere, Repository } from 'typeorm';
-import { AvailabilityRequestDTO } from './request.dto';
+import { AvailabilityRequestDTO } from './dto/request.dto';
 import { DateTime, Interval } from 'luxon';
 import {
+  AppointmentDTO,
   AppointmentScheduledDTO,
   AvailableAppointmentsDTO,
-} from './response.dto';
+} from './dto/response.dto';
+import { SchedulerRegistry } from '@nestjs/schedule';
+import {
+  APPOINTMENT_DURATION_MINUTES,
+  APPOINTMENT_LEAD_TIME_HOURS,
+  UNCONFIRMED_EXPIRY_MINUTES,
+} from '../common/appointment.constants';
+import { Helpers } from '../common/helpers';
+import { MINUTES_TO_MILLIS } from '../common/common.constants';
 
 @Injectable()
 export class AppointmentService {
@@ -22,7 +31,25 @@ export class AppointmentService {
   constructor(
     @InjectRepository(Appointment)
     private readonly repository: Repository<Appointment>,
+    private schedulerRegistry: SchedulerRegistry,
   ) {}
+
+  async getAppointmentById(appointmentId: string): Promise<AppointmentDTO> {
+    const appointment = await this.repository.findOne({
+      where: { appointmentId: Equal(appointmentId) },
+    });
+
+    if (!appointment) {
+      Helpers.logAndThrowError(
+        this.logger,
+        new NotFoundException(
+          `Appointment: ${appointmentId} not found, please confirm the appointmentId and try again.`,
+        ),
+      );
+    }
+
+    return appointment;
+  }
 
   async getAvailableAppointments(
     date?: DateTime,
@@ -39,16 +66,16 @@ export class AppointmentService {
       whereClause.provider = Equal(provider);
     }
     //get all appointments
-    return (await this.repository.find({ where: whereClause })).map(
-      (appointment) => {
-        return {
-          appointmentId: appointment.appointmentId,
-          provider: appointment.provider,
-          time: appointment.time,
-          available: appointment.available,
-        };
-      },
-    );
+    return (
+      await this.repository.find({ where: whereClause, order: { time: 'ASC' } })
+    ).map((appointment) => {
+      return {
+        appointmentId: appointment.appointmentId,
+        provider: appointment.provider,
+        time: appointment.time,
+        available: appointment.available,
+      };
+    });
   }
 
   async assignAppointmentToClient(
@@ -61,38 +88,42 @@ export class AppointmentService {
     });
 
     if (!appointment) {
-      const error = new NotFoundException(
-        `Appointment: ${appointmentId} not found, please confirm the appointmentId and try again.`,
+      Helpers.logAndThrowError(
+        this.logger,
+        new NotFoundException(
+          `Appointment: ${appointmentId} not found, please confirm the appointmentId and try again.`,
+        ),
       );
-      this.logger.error(error);
-      throw error;
     }
 
     if (!appointment.available && appointment.client !== client) {
-      const error = new ConflictException(
-        `Appointment: ${appointmentId} is already scheduled for another client.  Please choose a new time.`,
+      Helpers.logAndThrowError(
+        this.logger,
+        new ConflictException(
+          `Appointment: ${appointmentId} is already scheduled for another client.  Please choose a new time.`,
+        ),
       );
-      this.logger.error(error);
-      throw error;
     }
 
     const timeUntilAppt = Interval.fromDateTimes(
-      DateTime.now(),
-      appointment.time,
+      DateTime.now().toUTC(),
+      appointment.time.toUTC(),
     ).length('hours');
-    if (timeUntilAppt < 24) {
-      const error = new BadRequestException(
-        `Appointments must be made 24 hours in advance. Difference: ${timeUntilAppt.toFixed(
-          2,
-        )} Hours`,
+    if (timeUntilAppt < APPOINTMENT_LEAD_TIME_HOURS) {
+      Helpers.logAndThrowError(
+        this.logger,
+        new BadRequestException(
+          `Appointments must be made ${APPOINTMENT_LEAD_TIME_HOURS} hours in advance. Difference: ${timeUntilAppt.toFixed(
+            2,
+          )} Hours`,
+        ),
       );
-      this.logger.error(error);
-      throw error;
     }
     appointment.available = false;
     appointment.confirmed = false;
     appointment.client = client;
     await this.repository.save(appointment);
+    this.scheduleExpiry(appointment, UNCONFIRMED_EXPIRY_MINUTES);
 
     return {
       provider: appointment.provider,
@@ -111,15 +142,30 @@ export class AppointmentService {
     });
 
     if (!appointment) {
-      const error = new NotFoundException(
-        `Appointment: ${appointmentId} not found, please confirm the appointmentId and try again.`,
+      Helpers.logAndThrowError(
+        this.logger,
+        new NotFoundException(
+          `Appointment: ${appointmentId} not found, please confirm the appointmentId and try again.`,
+        ),
       );
-      this.logger.error(error);
-      throw error;
     }
-
+    if (appointment.available === true) {
+      Helpers.logAndThrowError(
+        this.logger,
+        new BadRequestException(
+          `Appointment: ${appointmentId} is currently available, please schedule the appointment before attempting to confirm.`,
+        ),
+      );
+    }
     appointment.confirmed = true;
     await this.repository.save(appointment);
+    try {
+      this.schedulerRegistry.deleteInterval(appointment.appointmentId);
+    } catch (e) {
+      if (!e.message.includes('No Interval was found')) {
+        throw e;
+      }
+    }
 
     return {
       provider: appointment.provider,
@@ -133,6 +179,7 @@ export class AppointmentService {
   async setProviderAvailability(
     provider: string,
     body: AvailabilityRequestDTO,
+    overwrite?: boolean,
   ): Promise<void> {
     this.logger.log('setProviderAvailability');
     const day = DateTime.fromISO(body.date);
@@ -149,26 +196,67 @@ export class AppointmentService {
       ],
     });
 
+    // validate enough availability for appointments
+    let slot = day.plus({
+      hour: body.start.hour,
+      minute: body.start.minute,
+    });
     if (
-      appointments.filter((appointment) => appointment.provider === provider)
-        .length !== 0
+      slot.plus({ minutes: APPOINTMENT_DURATION_MINUTES }).toMillis() >
+      end.toMillis()
     ) {
-      const error = new BadRequestException(
-        'Appointments already exists for provider',
+      Helpers.logAndThrowError(
+        this.logger,
+        new BadRequestException(
+          'Provider must submit enough availability for at least one appointment.',
+        ),
       );
-      this.logger.error(error);
-      throw error;
     }
+
+    const existingAppointments: Appointment[] = appointments.filter(
+      (appointment) => appointment.provider === provider,
+    );
+    if (existingAppointments.length !== 0) {
+      if (!overwrite) {
+        Helpers.logAndThrowError(
+          this.logger,
+          new BadRequestException('Appointments already exists for provider'),
+        );
+      }
+      for (const appointment of existingAppointments) {
+        this.repository.delete({
+          appointmentId: Equal(appointment.appointmentId),
+        });
+      }
+    }
+
     //create slots every 15 minutes from start to end time
-    let slot = day.plus({ hour: body.start.hour, minute: body.start.minute });
-    while (slot.plus(15).toMillis() <= end.toMillis()) {
+    while (
+      slot.plus({ minutes: APPOINTMENT_DURATION_MINUTES }).toMillis() <=
+      end.toMillis()
+    ) {
       const appointment: Appointment = {
         provider,
         time: slot,
         available: true,
       };
       await this.repository.save(appointment);
-      slot = slot.plus({ minutes: 15 });
+      slot = slot.plus({ minutes: APPOINTMENT_DURATION_MINUTES });
     }
+  }
+
+  private scheduleExpiry(appointment: Appointment, timeout: number) {
+    const callback = async () => {
+      this.logger.warn(
+        `Appointment ${appointment.appointmentId} unconfirmed, marking reavailable`,
+      );
+      appointment.client = null;
+      appointment.available = true;
+      await this.repository.save(appointment);
+      this.schedulerRegistry.deleteInterval(appointment.appointmentId);
+    };
+
+    const interval = setInterval(callback, timeout * MINUTES_TO_MILLIS);
+    this.schedulerRegistry.addInterval(appointment.appointmentId, interval);
   }
 }

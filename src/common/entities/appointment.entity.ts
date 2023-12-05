@@ -1,3 +1,4 @@
+import { UUID } from 'crypto';
 import { DateTime } from 'luxon';
 import {
   Column,
@@ -18,7 +19,7 @@ export class DateTimeTransformer implements ValueTransformer {
 
 @Entity('appointment')
 export class Appointment {
-  @PrimaryGeneratedColumn()
+  @PrimaryGeneratedColumn('uuid')
   appointmentId?: string;
 
   @Column({ length: 50, nullable: false })

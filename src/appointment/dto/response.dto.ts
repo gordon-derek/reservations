@@ -16,6 +16,7 @@ export class AppointmentDTO {
   @ApiProperty({
     description: 'DateTime of Appointment in ISO',
     type: DateTime,
+    example: '2023-12-06T05:15:00.000-08:00',
   })
   time: DateTime;
 
@@ -51,6 +52,7 @@ export class AvailableAppointmentsDTO {
   @ApiProperty({
     description: 'DateTime of Appointment in ISO',
     type: DateTime,
+    example: '2023-12-06T05:15:00.000-08:00',
   })
   time: DateTime;
 

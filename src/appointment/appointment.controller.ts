@@ -1,13 +1,31 @@
-import { Body, Controller, Get, Param, Post, Put, Query } from '@nestjs/common';
-import { AppointmentService } from './appointment.service';
-import { ApiOperation, ApiResponse } from '@nestjs/swagger';
 import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Put,
+  Query,
+  UsePipes,
+} from '@nestjs/common';
+import { AppointmentService } from './appointment.service';
+import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import {
+  AppointmentDTO,
   AppointmentScheduledDTO,
   AvailableAppointmentsDTO,
-} from './response.dto';
-import { AvailabilityRequestDTO, ScheduleAppointmentDTO } from './request.dto';
+} from './dto/response.dto';
+import {
+  AvailabilityRequestDTO,
+  ScheduleAppointmentDTO,
+} from './dto/request.dto';
 import { DateTime } from 'luxon';
+import { ParseISODatePipe } from '../common/validation/isodate.pipe';
+import { SchemaValidationPipe } from '../common/validation/schema.validation.pipe';
+import { AvailabilitySchemaValidationPipe } from '../common/validation/availability.pipe';
 
+@ApiTags('Appointments')
 @Controller('appointments')
 export class AppointmentController {
   constructor(private readonly appointmentService: AppointmentService) {}
@@ -16,12 +34,24 @@ export class AppointmentController {
   @ApiOperation({
     summary: 'Get Available Appointments',
   })
+  @ApiQuery({
+    name: 'date',
+    required: false,
+    description: 'the date you are looking for available appointments on',
+    example: '2024-01-01',
+  })
+  @ApiQuery({
+    name: 'provider',
+    required: false,
+    description: 'the provider you are looking for appointments with',
+    example: 'fLastName',
+  })
   @ApiResponse({
     status: 200,
     type: Array<AvailableAppointmentsDTO>,
   })
   async getAvailableAppointments(
-    @Query('date') date: string,
+    @Query('date', ParseISODatePipe) date: string,
     @Query('provider') provider: string,
   ): Promise<AvailableAppointmentsDTO[]> {
     return await this.appointmentService.getAvailableAppointments(
@@ -30,9 +60,23 @@ export class AppointmentController {
     );
   }
 
-  @Put('/:appointmentId/schedule')
+  @Get('/:appointmentId')
   @ApiOperation({
-    summary: 'Schedule Appointment to Client',
+    summary: 'Get appointment by ID',
+  })
+  @ApiResponse({
+    status: 200,
+    type: AppointmentDTO,
+  })
+  async getAppointment(
+    @Param('appointmentId', ParseUUIDPipe) appointmentId: string,
+  ) {
+    return await this.appointmentService.getAppointmentById(appointmentId);
+  }
+
+  @Put('/:appointmentId/reserve')
+  @ApiOperation({
+    summary: 'Reserve Appointment to Client',
   })
   @ApiResponse({
     status: 200,
@@ -50,7 +94,7 @@ export class AppointmentController {
 
   @Put('/:appointmentId/confirm')
   @ApiOperation({
-    summary: 'Assign Appointment to Client',
+    summary: 'Confirm Appointment for Client',
   })
   @ApiResponse({
     status: 200,
@@ -64,13 +108,25 @@ export class AppointmentController {
   @ApiOperation({
     summary: 'Add Availability for a provider',
   })
+  @ApiQuery({
+    name: 'overwrite',
+    required: false,
+    description: 'flag if provider wants to overwrite their availability',
+    example: '2024-01-01',
+  })
   @ApiResponse({
     status: 201,
   })
+  @UsePipes(new SchemaValidationPipe(AvailabilitySchemaValidationPipe))
   async setProviderAvailability(
     @Param('provider') provider: string,
     @Body() request: AvailabilityRequestDTO,
+    @Query('overwrite') overwrite?: boolean,
   ): Promise<void> {
-    await this.appointmentService.setProviderAvailability(provider, request);
+    await this.appointmentService.setProviderAvailability(
+      provider,
+      request,
+      overwrite ?? false,
+    );
   }
 }
